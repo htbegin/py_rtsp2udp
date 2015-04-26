@@ -2,22 +2,67 @@
 
 import os
 import sys
+from optparse import OptionParser
+import logging
+
+# Disable scapy runtime warning
+# "WARNING: No route found for IPv6 destination :: (no default route?)"
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+del logging
 from scapy.all import *
 
-def all_tcp_pkt_load(pkts):
-    for p in pkts:
-        if TCP in p:
-            # IP data diagram len - IP hdr len - TCP hdr len
-            load_len = p[IP].len - p[IP].ihl * 4 - p[TCP].dataofs * 4
-            if 0 < load_len:
-                yield p[TCP].load
+def is_expected_tcp_pkt(p, s_d_port, used_s_d_port):
+    sport, dport = s_d_port
 
-def rtsp_to_udp(fname):
+    pkt_sport, pkt_dport = p[TCP].sport, p[TCP].dport
+    exp_pkt_sport = sport if sport is not None else pkt_sport
+    exp_pkt_dport = dport if dport is not None else pkt_dport
+
+    port_matched = False
+    if pkt_sport == exp_pkt_sport and pkt_dport == exp_pkt_dport:
+        port_matched = True
+
+    action = "Got" if port_matched else "Filter"
+    if (pkt_sport, pkt_dport) not in used_s_d_port:
+        print "%-6s TCP flow (%-5u -> %5u)" % (action, pkt_sport, pkt_dport)
+        used_s_d_port.add((pkt_sport, pkt_dport))
+
+    is_expected = False
+    # IP data diagram len - IP hdr len - TCP hdr len
+    load_len = p[IP].len - p[IP].ihl * 4 - p[TCP].dataofs * 4
+    if port_matched and 0 < load_len:
+        is_expected = True
+
+    return is_expected
+
+def all_tcp_pkt_load(pkts, s_d_port):
+    used_s_d_port = set()
+    for p in pkts:
+        if TCP in p and is_expected_tcp_pkt(p, s_d_port, used_s_d_port):
+            yield p[TCP].load
+
+def port_pair_to_filter_str(sport, dport):
+    cond = []
+    if sport is not None:
+        cond.append("sport == %d" % sport)
+    if dport is not None:
+        cond.append("dport == %d" % dport)
+
+    if cond:
+        return " and ".join(cond)
+    else:
+        return "none"
+
+def rtsp_to_udp(fname, s_d_port):
     pkts = rdpcap(fname)
 
     load_list = []
-    for l in all_tcp_pkt_load(pkts):
+    for l in all_tcp_pkt_load(pkts, s_d_port):
         load_list.append(l)
+
+    if not load_list:
+        print "No valid pkt for filter (%s)" % port_pair_to_filter_str(*s_d_port)
+        return
 
     load_array = "".join(load_list)
 
@@ -56,17 +101,22 @@ def rtsp_to_udp(fname):
     if udp_pkt_list:
         name_prefix, ext = os.path.splitext(fname)
         udp_fname = "udp_%s%s" % (name_prefix, ext)
-        print "%s -> %s" % (fname, udp_fname)
+        print "In: %s, Out: %s" % (fname, udp_fname)
         wrpcap(udp_fname, udp_pkt_list)
 
 if __name__ == "__main__":
-    ret = 0
-    if 1 < len(sys.argv):
-        for fname in sys.argv[1:]:
-            rtsp_to_udp(fname)
-    else:
-        sys.stderr.write("Usage: %s pcap_files..." % sys.argv[0])
-        ret = 1
+    parser = OptionParser()
+    parser.add_option("-s", "--sport", dest="sport", type="int",
+                      help="tcp source port")
+    parser.add_option("-d", "--dport", dest="dport", type="int",
+                      help="tcp destination port")
+    parser.add_option("-f", "--file", dest="pcap_fname", help="the file name of pcap")
 
-    sys.exit(ret)
+    options, _ = parser.parse_args()
+    if options.pcap_fname is None:
+        parser.print_help()
+        sys.exit(1)
+
+    rtsp_to_udp(options.pcap_fname, (options.sport, options.dport))
+    sys.exit(0)
 
