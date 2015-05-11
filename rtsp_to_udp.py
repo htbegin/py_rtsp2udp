@@ -99,8 +99,9 @@ def rtsp_to_udp(fname, s_d_port):
         udp_pkt_list.append(udp_pkt)
 
     if udp_pkt_list:
-        name_prefix, ext = os.path.splitext(fname)
-        udp_fname = "udp_%s%s" % (name_prefix, ext)
+        full_fpath = os.path.abspath(fname)
+        name_prefix, ext = os.path.splitext(os.path.basename(full_fpath))
+        udp_fname = os.path.join(os.path.dirname(full_fpath), "udp_%s%s" % (name_prefix, ext))
         print "In: %s, Out: %s" % (fname, udp_fname)
         wrpcap(udp_fname, udp_pkt_list)
 
