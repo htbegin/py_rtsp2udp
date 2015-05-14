@@ -39,7 +39,7 @@ def all_tcp_pkt_load(pkts, s_d_port):
     used_s_d_port = set()
     for p in pkts:
         if TCP in p and is_expected_tcp_pkt(p, s_d_port, used_s_d_port):
-            yield p[TCP].load
+            yield (p[TCP].sport, p[TCP].dport), p[TCP].load
 
 def port_pair_to_filter_str(sport, dport):
     cond = []
@@ -53,16 +53,8 @@ def port_pair_to_filter_str(sport, dport):
     else:
         return "none"
 
-def rtsp_to_udp(fname, s_d_port):
-    pkts = rdpcap(fname)
-
-    load_list = []
-    for l in all_tcp_pkt_load(pkts, s_d_port):
-        load_list.append(l)
-
-    if not load_list:
-        print "No valid pkt for filter (%s)" % port_pair_to_filter_str(*s_d_port)
-        return
+def gen_udp_load_list(load_list):
+    udp_load_list = []
 
     load_array = "".join(load_list)
 
@@ -70,7 +62,6 @@ def rtsp_to_udp(fname, s_d_port):
     chan_list = [0, 2]
     max_sz = 64 << 10
     max_idx = len(load_array) - 1
-    udp_load_list = []
     while True:
         if max_idx < idx + 3:
             break
@@ -92,18 +83,40 @@ def rtsp_to_udp(fname, s_d_port):
 
         idx += 1
 
-    udp_pkt_list = []
-    for load in udp_load_list:
-        udp_pkt = Ether(dst="00:00:00:00:00:00", src="00:00:00:00:00:00")/IP()/ \
-                  UDP(dport=6000, sport=7000)/load
-        udp_pkt_list.append(udp_pkt)
+    return udp_load_list
 
-    if udp_pkt_list:
-        full_fpath = os.path.abspath(fname)
-        name_prefix, ext = os.path.splitext(os.path.basename(full_fpath))
-        udp_fname = os.path.join(os.path.dirname(full_fpath), "udp_%s%s" % (name_prefix, ext))
-        print "In: %s, Out: %s" % (fname, udp_fname)
-        wrpcap(udp_fname, udp_pkt_list)
+def rtsp_to_udp(fname, s_d_port):
+    pkts = rdpcap(fname)
+
+    load_list_map = {}
+    for pt_pair, load in all_tcp_pkt_load(pkts, s_d_port):
+        load_list_map.setdefault(pt_pair, []).append(load)
+
+    if not load_list_map:
+        print "No valid pkt for filter (%s)" % port_pair_to_filter_str(*s_d_port)
+        return
+
+    full_fpath = os.path.abspath(fname)
+    pcap_dir = os.path.dirname(full_fpath)
+    name_prefix, ext = os.path.splitext(os.path.basename(full_fpath))
+
+    for idx, (pt_pair, load_list) in enumerate(load_list_map.iteritems()):
+        udp_load_list = gen_udp_load_list(load_list)
+
+        udp_pkt_list = []
+        for load in udp_load_list:
+            udp_pkt = Ether(dst="00:00:00:00:00:00", src="00:00:00:00:00:00")/IP()/ \
+                      UDP(dport=6000+idx, sport=7000+idx)/load
+            udp_pkt_list.append(udp_pkt)
+
+        if udp_pkt_list:
+            if len(load_list_map) != 1:
+                uniq_name = "udp"
+            else:
+                uniq_name = "udp_src_%u_dst_%u" % pt_pair
+            udp_fname = os.path.join(pcap_dir, "%s_%s%s" % (uniq_name, name_prefix, ext))
+            print "In: %s, Out: %s" % (fname, udp_fname)
+            wrpcap(udp_fname, udp_pkt_list)
 
 if __name__ == "__main__":
     parser = OptionParser()
