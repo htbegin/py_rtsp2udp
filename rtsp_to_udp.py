@@ -2,6 +2,7 @@
 
 import os
 import sys
+from collections import namedtuple
 from optparse import OptionParser
 import logging
 
@@ -11,47 +12,47 @@ logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 del logging
 from scapy.all import *
 
-def is_expected_tcp_pkt(p, s_d_port, used_s_d_port):
-    sport, dport = s_d_port
+sp_fields = ("saddr", "sport", "daddr", "dport")
+class SockPair(namedtuple("SockPair", sp_fields)):
+    def __str__(self):
+        def _astr(addr):
+            return addr if addr is not None else "all"
+        def _pstr(port):
+            return "%-5u" % port if port is not None else "*"
+        return "%s:%s -> %s:%s" % (_astr(self.saddr), _pstr(self.sport),
+                                   _astr(self.daddr), _pstr(self.dport))
 
-    pkt_sport, pkt_dport = p[TCP].sport, p[TCP].dport
-    exp_pkt_sport = sport if sport is not None else pkt_sport
-    exp_pkt_dport = dport if dport is not None else pkt_dport
+    def match_template(self, tmpt):
+        matched = True
+        for f in sp_fields:
+            self_val = getattr(self, f)
+            tmpt_val = getattr(tmpt, f)
+            if self_val != tmpt_val and tmpt_val is not None:
+                matched = False
+                break
+        return matched
 
-    port_matched = False
-    if pkt_sport == exp_pkt_sport and pkt_dport == exp_pkt_dport:
-        port_matched = True
+    def cname(self):
+        return "%s_%u_to_%s_%u" % (self.saddr, self.sport, self.daddr, self.dport)
 
-    action = "Got" if port_matched else "Filter"
-    if (pkt_sport, pkt_dport) not in used_s_d_port:
-        print "%-6s TCP flow (%-5u -> %5u)" % (action, pkt_sport, pkt_dport)
-        used_s_d_port.add((pkt_sport, pkt_dport))
-
-    is_expected = False
+def pkt_has_tcp_payload(p):
     # IP data diagram len - IP hdr len - TCP hdr len
     load_len = p[IP].len - p[IP].ihl * 4 - p[TCP].dataofs * 4
-    if port_matched and 0 < load_len:
-        is_expected = True
+    return 0 < load_len
 
-    return is_expected
-
-def all_tcp_pkt_load(pkts, s_d_port):
-    used_s_d_port = set()
+def filtered_tcp_pkt_load(pkts, tmpt_sk_pair):
+    used_sk_pair = set()
     for p in pkts:
-        if TCP in p and is_expected_tcp_pkt(p, s_d_port, used_s_d_port):
-            yield (p[TCP].sport, p[TCP].dport), p[TCP].load
+        if TCP in p:
+            pkt_sk_pair = SockPair(p[IP].src, p[TCP].sport, p[IP].dst, p[TCP].dport)
+            pkt_matched = pkt_sk_pair.match_template(tmpt_sk_pair)
+            action = "Got" if pkt_matched else "Filter"
+            if pkt_sk_pair not in used_sk_pair:
+                print "%-6s TCP flow [%s]" % (action, str(pkt_sk_pair))
+                used_sk_pair.add(pkt_sk_pair)
 
-def port_pair_to_filter_str(sport, dport):
-    cond = []
-    if sport is not None:
-        cond.append("sport == %d" % sport)
-    if dport is not None:
-        cond.append("dport == %d" % dport)
-
-    if cond:
-        return " and ".join(cond)
-    else:
-        return "none"
+            if pkt_matched and pkt_has_tcp_payload(p):
+                yield pkt_sk_pair, p[TCP].load
 
 def gen_udp_load_list(load_list):
     udp_load_list = []
@@ -85,22 +86,22 @@ def gen_udp_load_list(load_list):
 
     return udp_load_list
 
-def rtsp_to_udp(fname, s_d_port):
+def rtsp_to_udp(fname, sk_pair):
     pkts = rdpcap(fname)
 
     load_list_map = {}
-    for pt_pair, load in all_tcp_pkt_load(pkts, s_d_port):
-        load_list_map.setdefault(pt_pair, []).append(load)
+    for pkt_sk_pair, load in filtered_tcp_pkt_load(pkts, sk_pair):
+        load_list_map.setdefault(pkt_sk_pair, []).append(load)
 
     if not load_list_map:
-        print "No valid pkt for filter (%s)" % port_pair_to_filter_str(*s_d_port)
+        print "No valid pkt for filter [%s]" % str(sk_pair)
         return
 
     full_fpath = os.path.abspath(fname)
     pcap_dir = os.path.dirname(full_fpath)
     name_prefix, ext = os.path.splitext(os.path.basename(full_fpath))
 
-    for idx, (pt_pair, load_list) in enumerate(load_list_map.iteritems()):
+    for idx, (pkt_sk_pair, load_list) in enumerate(load_list_map.iteritems()):
         udp_load_list = gen_udp_load_list(load_list)
 
         udp_pkt_list = []
@@ -110,10 +111,10 @@ def rtsp_to_udp(fname, s_d_port):
             udp_pkt_list.append(udp_pkt)
 
         if udp_pkt_list:
-            if len(load_list_map) != 1:
+            if len(load_list_map) == 1:
                 uniq_name = "udp"
             else:
-                uniq_name = "udp_src_%u_dst_%u" % pt_pair
+                uniq_name = "udp_%s" % pkt_sk_pair.cname()
             udp_fname = os.path.join(pcap_dir, "%s_%s%s" % (uniq_name, name_prefix, ext))
             print "In: %s, Out: %s" % (fname, udp_fname)
             wrpcap(udp_fname, udp_pkt_list)
@@ -124,13 +125,18 @@ if __name__ == "__main__":
                       help="tcp source port")
     parser.add_option("-d", "--dport", dest="dport", type="int",
                       help="tcp destination port")
-    parser.add_option("-f", "--file", dest="pcap_fname", help="the file name of pcap")
+    parser.add_option("-f", "--saddr", dest="saddr", type="string",
+                      help="tcp source addr")
+    parser.add_option("-t", "--daddr", dest="daddr", type="string",
+                      help="tcp destination addr")
+    parser.add_option("-i", "--input", dest="pcap_fname", help="the file name of pcap")
 
     options, _ = parser.parse_args()
     if options.pcap_fname is None:
         parser.print_help()
         sys.exit(1)
 
-    rtsp_to_udp(options.pcap_fname, (options.sport, options.dport))
+    rtsp_to_udp(options.pcap_fname,
+                SockPair(options.saddr, options.sport, options.daddr, options.dport))
     sys.exit(0)
 
