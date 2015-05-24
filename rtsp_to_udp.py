@@ -145,13 +145,11 @@ def add_missed_seq(start_seq, end_seq, seq_range):
 
     return action, arg
 
-def update_seq_range(sk_pair, seq, load_sz,
+# [start, end)
+def update_seq_range(sk_pair, start_seq, end_seq,
                      seq_range, next_pos):
     action, arg = APPEND, None
 
-    TCP_SEQ_MASK = (2 << 32) - 1
-    # [start, end)
-    start_seq, end_seq = seq, (seq + load_sz) & TCP_SEQ_MASK
     cur_range = [start_seq, end_seq]
     got_range = seq_range.setdefault(GOT_SEQ_KEY, cur_range)
     missed_range = seq_range.setdefault(MISSED_SEQ_KEY, [])
@@ -172,28 +170,39 @@ def update_seq_range(sk_pair, seq, load_sz,
 
     return action, arg
 
-def dump_ignored_seq_range(sk_pair, seq_range):
-    ignored_range = seq_range[IGNORED_SEQ_KEY]
+def dump_ignored_seq_range(sk_pair, ignored_range):
     if ignored_range:
-        print "Ignored seq range on %s:" % str(sk_pair)
+        print "Ignored seq range (total %u) on %s:" % (len(ignored_range), str(sk_pair))
         for idx, (start, end) in enumerate(ignored_range):
-            print "\t#%u [%10u, %10u)" % (idx + 1, start, end)
+            print " #%-10u [%10u, %10u)" % (idx + 1, start, end)
+
+def dump_load_seq_list(sk_pair, seq_list):
+    if seq_list:
+        print "Used seq range (total %u) on %s:" % (len(seq_list), str(sk_pair))
+        for idx, (start, end) in enumerate(seq_list):
+            print " #%-10u [%10u, %10u)" % (idx + 1, start, end)
 
 def rtsp_to_udp(fname, sk_pair):
+    TCP_SEQ_MASK = (2 << 32) - 1
     pkts = rdpcap(fname)
 
     load_list_map = {}
     seq_range_map = {}
+    load_seq_list_map = {}
     for pkt_sk_pair, seq, load in filtered_tcp_pkt_load(pkts, sk_pair):
         load_list = load_list_map.setdefault(pkt_sk_pair, [])
         seq_range = seq_range_map.setdefault(pkt_sk_pair, {})
+        load_seq_list = load_seq_list_map.setdefault(pkt_sk_pair, [])
 
-        action, arg = update_seq_range(pkt_sk_pair, seq, len(load),
+        start_seq, end_seq = seq, (seq + len(load)) & TCP_SEQ_MASK
+        action, arg = update_seq_range(pkt_sk_pair, start_seq, end_seq,
                                        seq_range, len(load_list))
         if APPEND == action:
             load_list.append(load)
+            load_seq_list.append((start_seq, end_seq))
         elif INSERT == action:
             load_list.insert(arg, load)
+            load_seq_list.insert(arg, (start_seq, end_seq))
         elif IGNORE == action:
             pass
 
@@ -206,7 +215,10 @@ def rtsp_to_udp(fname, sk_pair):
     name_prefix, ext = os.path.splitext(os.path.basename(full_fpath))
 
     for idx, (pkt_sk_pair, load_list) in enumerate(load_list_map.iteritems()):
-        dump_ignored_seq_range(pkt_sk_pair, seq_range_map[pkt_sk_pair])
+        dump_ignored_seq_range(pkt_sk_pair, seq_range_map[pkt_sk_pair][IGNORED_SEQ_KEY])
+
+        if options.verbose:
+            dump_load_seq_list(pkt_sk_pair, load_seq_list_map[pkt_sk_pair])
 
         udp_load_list = gen_udp_load_list(load_list)
 
@@ -236,6 +248,8 @@ if __name__ == "__main__":
     parser.add_option("-t", "--daddr", dest="daddr", type="string",
                       help="tcp destination addr")
     parser.add_option("-i", "--input", dest="pcap_fname", help="the file name of pcap")
+    parser.add_option("-v", "--verbose", dest="verbose", default=False, action="store_true",
+                      help="more debug info")
 
     options, _ = parser.parse_args()
     if options.pcap_fname is None:
