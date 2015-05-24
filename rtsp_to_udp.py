@@ -58,13 +58,12 @@ def filtered_tcp_pkt_load(pkts, tmpt_sk_pair):
             if pkt_matched and pkt_has_tcp_payload(p):
                 yield pkt_sk_pair, p[TCP].seq, p[TCP].load
 
-def gen_udp_load_list(load_list):
+def gen_udp_load_list(chan_list, load_list):
     udp_load_list = []
 
     load_array = "".join(load_list)
 
     idx = 0
-    chan_list = [0, 2]
     max_sz = 64 << 10
     max_idx = len(load_array) - 1
     while True:
@@ -182,7 +181,7 @@ def dump_load_seq_list(sk_pair, seq_list):
         for idx, (start, end) in enumerate(seq_list):
             print " #%-10u [%10u, %10u)" % (idx + 1, start, end)
 
-def rtsp_to_udp(fname, sk_pair):
+def rtsp_to_udp(fname, valid_chan, sk_pair):
     TCP_SEQ_MASK = (2 << 32) - 1
     pkts = rdpcap(fname)
 
@@ -220,7 +219,7 @@ def rtsp_to_udp(fname, sk_pair):
         if options.verbose:
             dump_load_seq_list(pkt_sk_pair, load_seq_list_map[pkt_sk_pair])
 
-        udp_load_list = gen_udp_load_list(load_list)
+        udp_load_list = gen_udp_load_list(valid_chan, load_list)
 
         udp_pkt_list = []
         for load in udp_load_list:
@@ -248,6 +247,8 @@ if __name__ == "__main__":
     parser.add_option("-t", "--daddr", dest="daddr", type="string",
                       help="tcp destination addr")
     parser.add_option("-i", "--input", dest="pcap_fname", help="the file name of pcap")
+    parser.add_option("-c", "--chan", dest="chan", type="int",
+                      action="append", help="the valid channel")
     parser.add_option("-v", "--verbose", dest="verbose", default=False, action="store_true",
                       help="more debug info")
 
@@ -256,7 +257,13 @@ if __name__ == "__main__":
         parser.print_help()
         sys.exit(1)
 
-    rtsp_to_udp(options.pcap_fname,
+    if options.chan is None:
+        options.chan = (0, 2)
+    valid_chan = set(options.chan)
+    if options.verbose:
+        print "Valid channel list: %s" % ", ".join([str(c) for c in valid_chan])
+
+    rtsp_to_udp(options.pcap_fname, valid_chan,
                 SockPair(options.saddr, options.sport, options.daddr, options.dport))
     sys.exit(0)
 
