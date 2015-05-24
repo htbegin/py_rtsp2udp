@@ -12,6 +12,10 @@ logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 del logging
 from scapy.all import *
 
+GOT_SEQ_KEY, MISSED_SEQ_KEY, IGNORED_SEQ_KEY = "got", "missed", "ignored"
+MIN_SEQ_IDX, EXP_SEQ_IDX = range(2)
+APPEND, INSERT, IGNORE = range(3)
+
 sp_fields = ("saddr", "sport", "daddr", "dport")
 class SockPair(namedtuple("SockPair", sp_fields)):
     def __str__(self):
@@ -52,7 +56,7 @@ def filtered_tcp_pkt_load(pkts, tmpt_sk_pair):
                 used_sk_pair.add(pkt_sk_pair)
 
             if pkt_matched and pkt_has_tcp_payload(p):
-                yield pkt_sk_pair, p[TCP].load
+                yield pkt_sk_pair, p[TCP].seq, p[TCP].load
 
 def gen_udp_load_list(load_list):
     udp_load_list = []
@@ -86,12 +90,112 @@ def gen_udp_load_list(load_list):
 
     return udp_load_list
 
+# True if a after b
+def is_u32_seq_after(a, b):
+    def two_s_complement(n):
+        s = 31
+        w = 2 << s
+        m = w - 1
+        return (-w * (n >> s) + (n & m))
+
+    return two_s_complement(b) - two_s_complement(a) < 0
+
+def add_missed_seq(start_seq, end_seq, seq_range):
+    action, arg = IGNORE, None
+
+    found = False
+    missed_range = seq_range[MISSED_SEQ_KEY]
+    for idx, (start, end, pos) in enumerate(missed_range):
+        if start <= start_seq and end_seq <= end:
+            if start == start_seq and end_seq == end:
+                del missed_range[idx]
+            else:
+                new_entry_idx = idx
+                if start < start_seq:
+                    # replace the origin missed entry
+                    # insert the load before [start_seq, end_seq) => pos
+                    missed_range[new_entry_idx] = (start, start_seq, pos)
+                    new_entry_idx += 1
+                if end_seq < end:
+                    # insert the lod after [start_seq, end_seq) => pos + 1
+                    # replace or insert after the missed entry
+                    new_entry = (end_seq, end, pos + 1)
+                    if new_entry_idx == idx:
+                        missed_range[new_entry_idx] = new_entry
+                    else:
+                        missed_range.insert(new_entry_idx, new_entry)
+            found, action, arg = True, INSERT, pos
+            break
+
+    if not found:
+
+        min_seq = got_range[MIN_SEQ_IDX]
+        if min_seq == end_seq or is_u32_seq_after(min_seq, end_seq):
+            print "Prepend tcp range [%u, %u) (min %u) on %s" % \
+                  (start_seq, end_seq, min_seq, str(sk_pair))
+
+            if min_seq != end_seq:
+                missed_range.insert(0, (end_seq, min_seq, 1))
+            got_range[MIN_SEQ_IDX] = start_seq
+
+            action = INSERT, 0
+        else:
+            ignored_range = seq_range[IGNORED_SEQ_KEY]
+            ignored_range.append((start_seq, end_seq))
+
+    return action, arg
+
+def update_seq_range(sk_pair, seq, load_sz,
+                     seq_range, next_pos):
+    action, arg = APPEND, None
+
+    TCP_SEQ_MASK = (2 << 32) - 1
+    # [start, end)
+    start_seq, end_seq = seq, (seq + load_sz) & TCP_SEQ_MASK
+    cur_range = [start_seq, end_seq]
+    got_range = seq_range.setdefault(GOT_SEQ_KEY, cur_range)
+    missed_range = seq_range.setdefault(MISSED_SEQ_KEY, [])
+    seq_range.setdefault(IGNORED_SEQ_KEY, [])
+
+    if got_range != cur_range:
+        exp_seq = got_range[EXP_SEQ_IDX]
+
+        # the most likely case
+        if start_seq == exp_seq:
+            got_range[EXP_SEQ_IDX] = end_seq
+        elif is_u32_seq_after(start_seq, exp_seq):
+            got_range[EXP_SEQ_IDX] = end_seq
+            missed_range.append([exp_seq, start_seq, next_pos])
+        else:
+            # No need to update the expected seq
+            action, arg = add_missed_seq(start_seq, end_seq, seq_range)
+
+    return action, arg
+
+def dump_ignored_seq_range(sk_pair, seq_range):
+    ignored_range = seq_range[IGNORED_SEQ_KEY]
+    if ignored_range:
+        print "Ignored seq range on %s:" % str(sk_pair)
+        for idx, (start, end) in enumerate(ignored_range):
+            print "\t#%u [%10u, %10u)" % (idx + 1, start, end)
+
 def rtsp_to_udp(fname, sk_pair):
     pkts = rdpcap(fname)
 
     load_list_map = {}
-    for pkt_sk_pair, load in filtered_tcp_pkt_load(pkts, sk_pair):
-        load_list_map.setdefault(pkt_sk_pair, []).append(load)
+    seq_range_map = {}
+    for pkt_sk_pair, seq, load in filtered_tcp_pkt_load(pkts, sk_pair):
+        load_list = load_list_map.setdefault(pkt_sk_pair, [])
+        seq_range = seq_range_map.setdefault(pkt_sk_pair, {})
+
+        action, arg = update_seq_range(pkt_sk_pair, seq, len(load),
+                                       seq_range, len(load_list))
+        if APPEND == action:
+            load_list.append(load)
+        elif INSERT == action:
+            load_list.insert(arg, load)
+        elif IGNORE == action:
+            pass
 
     if not load_list_map:
         print "No valid pkt for filter [%s]" % str(sk_pair)
@@ -102,6 +206,8 @@ def rtsp_to_udp(fname, sk_pair):
     name_prefix, ext = os.path.splitext(os.path.basename(full_fpath))
 
     for idx, (pkt_sk_pair, load_list) in enumerate(load_list_map.iteritems()):
+        dump_ignored_seq_range(pkt_sk_pair, seq_range_map[pkt_sk_pair])
+
         udp_load_list = gen_udp_load_list(load_list)
 
         udp_pkt_list = []
