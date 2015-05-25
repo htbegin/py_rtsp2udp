@@ -99,7 +99,7 @@ def is_u32_seq_after(a, b):
 
     return two_s_complement(b) - two_s_complement(a) < 0
 
-def add_missed_seq(start_seq, end_seq, seq_range):
+def add_missed_seq(sk_pair, start_seq, end_seq, seq_range):
     action, arg = IGNORE, None
 
     found = False
@@ -126,12 +126,14 @@ def add_missed_seq(start_seq, end_seq, seq_range):
             found, action, arg = True, INSERT, pos
             break
 
-    if not found:
-
+    sk_pair_str = str(sk_pair)
+    if found:
+        print "Handle tcp retransmission [%u, %u) on %s" % (start_seq, end_seq, sk_pair_str)
+    else:
         min_seq = got_range[MIN_SEQ_IDX]
         if min_seq == end_seq or is_u32_seq_after(min_seq, end_seq):
             print "Prepend tcp range [%u, %u) (min %u) on %s" % \
-                  (start_seq, end_seq, min_seq, str(sk_pair))
+                  (start_seq, end_seq, min_seq, sk_pair_str)
 
             if min_seq != end_seq:
                 missed_range.insert(0, (end_seq, min_seq, 1))
@@ -165,7 +167,7 @@ def update_seq_range(sk_pair, start_seq, end_seq,
             missed_range.append([exp_seq, start_seq, next_pos])
         else:
             # No need to update the expected seq
-            action, arg = add_missed_seq(start_seq, end_seq, seq_range)
+            action, arg = add_missed_seq(sk_pair, start_seq, end_seq, seq_range)
 
     return action, arg
 
@@ -175,11 +177,18 @@ def dump_ignored_seq_range(sk_pair, ignored_range):
         for idx, (start, end) in enumerate(ignored_range):
             print " #%-10u [%10u, %10u)" % (idx + 1, start, end)
 
-def dump_load_seq_list(sk_pair, seq_list):
+def dump_load_seq_list(verbose, sk_pair, seq_list):
     if seq_list:
-        print "Used seq range (total %u) on %s:" % (len(seq_list), str(sk_pair))
+        if verbose:
+            print "Used seq range (total %u) on %s:" % (len(seq_list), str(sk_pair))
+        exp_start = seq_list[0][0]
         for idx, (start, end) in enumerate(seq_list):
-            print " #%-10u [%10u, %10u)" % (idx + 1, start, end)
+            if start == exp_start:
+                if verbose:
+                    print " #%-10u [%10u, %10u)" % (idx + 1, start, end)
+            else:
+                print " %-11%s [%10u, %10u)" % ("missed", exp_start, start)
+            exp_start = end
 
 def rtsp_to_udp(fname, valid_chan, sk_pair):
     TCP_SEQ_MASK = (2 << 32) - 1
@@ -215,9 +224,7 @@ def rtsp_to_udp(fname, valid_chan, sk_pair):
 
     for idx, (pkt_sk_pair, load_list) in enumerate(load_list_map.iteritems()):
         dump_ignored_seq_range(pkt_sk_pair, seq_range_map[pkt_sk_pair][IGNORED_SEQ_KEY])
-
-        if options.verbose:
-            dump_load_seq_list(pkt_sk_pair, load_seq_list_map[pkt_sk_pair])
+        dump_load_seq_list(options.verbose, pkt_sk_pair, load_seq_list_map[pkt_sk_pair])
 
         udp_load_list = gen_udp_load_list(valid_chan, load_list)
 
